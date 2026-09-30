@@ -1,33 +1,24 @@
-# 工程说明
+# 工程说明 · 0.1.1
 
-应用 ID 为 `com.ltrj.chatadvisor`；内部 Kotlin namespace 保留 `com.jev.probe`，用于复用 Jev 代码，不影响与 Jev 并存。无障碍服务为真实应用的 `com.jev.probe.capture.ChatCaptureService`，不注册上游伪装的系统服务类。
+应用ID `com.ltrj.chatadvisor`，namespace `com.jev.probe`。JDK17、SDK35、Gradle8.9、AGP8.7.3、Kotlin1.9.24；只交付ARM64自用调试APK。
 
-## 数据流
+## 悬浮与截图
 
-前台包名事件 → 手动悬浮球 → `ScreenCapture` → 内存截图 → `ReviewActivity` / `CropPreview` → `MlKitOcr` → 用户校对 → `AdvisorClient` → `AdvisorPipeline` → 结果页／`BubbleOverlay` → 仅复制候选。
+ChatCaptureService监听窗口状态/列表变化，通过应用窗口的包名、类型、焦点选择前台。键盘/系统/浮层不作为应用身份。100ms事件合并及启用时1500ms状态核对仅检查窗口身份，不自动读取聊天正文、OCR或分析。
+无法确认应用时不发起截图；短暂窗口空缺最多保留2秒的显示判断。锁屏/熄屏隐藏，旋转重新挂载，服务重连恢复状态。常驻通知和主页提供用户恢复入口；系统关闭无障碍时不绕过权限。
+手动截图继续使用最低1秒间隔、失败退避和3秒超时。自己的浮层临时隐藏独立于前台状态；截图失败不清除原会话，成功后先保存已有草稿。回调检查前台应用、会话与生命周期。
 
-截图最低间隔 1 秒；失败退避上限 30 秒，回调 watchdog 为 3 秒；截图取消／超时后恢复悬浮状态并丢弃迟到回调。标准服务截图被拒绝时，不自动尝试其他机制，提供导入或文本入口。
+## 模型与资料
 
-截图先裁剪。OCR 保留行矩形坐标与屏幕顺序；左、右提示只是候选说话人，居中的行为 unknown。用户须选择我／对方、删除时间等杂项、合并多行并确认。确认之后聊天最多 12000 字；所有行非空、所有说话人已映射，才允许发送。
+原判断→军师生成→排序流程与规则保持。生成失败不提供占位话术；恰好三条不同非空候选，格式只额外请求一次，排序失败无伪造概率。
+背景只在用户勾选时加入，联系人ID优先，名称匹配作为兼容路径；旧版自动历史注入关闭。ContactExtractor复用回复接口，提取字段必须是原文引用，用户编辑预览后保存，不由模型直接写资料。TXT最多256KB/12000字，UTF-8、UTF-8 BOM及GB18030，超限不截断。
 
-## 模型与资源
+## 持久化与请求
 
-Jev 使用原有选择／评分接口；生成模型使用 OpenAI-compatible chat completions 协议。Jev 是概率提示，不能成为已知事实。`AdvisorPipeline` 支持独立判断、生成、排序失败测试；生成失败直接报错，绝不补占位候选。格式错误只多请求一次。
+ManualSession保留运行状态与位图；SessionRecord保存不变的文字快照，schema1包含会话ID、来源、联系人ID、文字、背景/目标、结果及时间，不保存位图、密钥、gate或运行请求。
+SessionStore位于私有 `filesDir/advisor-records`：draft.json为当前草稿，history/UUID.json为成功建议。串行写入、AtomicFile写独立事务文件、同目录原子替换及写后验证；写入异常返回失败，已损坏文件保留且拒绝覆盖。
+文件替换使用Android11+可用的[Files.move](https://developer.android.com/reference/java/nio/file/Files)原子选项；不支持原子替换时报告失败，不降级为先删除原文件。
+编辑延迟500ms保存，离开页面提交快照，发起分析前保存输入。结果只有通过会话/请求gate检查后才进入历史；重新分析分配新历史ID，旧记录保留。已接受的成功结果保存不因随后退出页面而取消。
+历史打开克隆新会话，重启恢复草稿保留其ID、重新要求用户确认，不恢复网络请求。联系人删除解除记录关联，删除建议不删除联系人。历史不自动发给模型，不自动建立关系摘要。
 
-`AdvisorResult` 有 emotion、facts、inferences、unknowns、recommendation、nextStep、stopCondition、三条 strategy/text 候选及可选概率、判断与警告。解析验证所有必需字段和恰好三条不同且非空候选；概率来自有效 Jev 排序，失败时为 null。
-
-核心提示词常驻；`KnowledgeRouter` 选择 reply + 一个主题（安全优先）+ digital，最多三份参考。用户背景和聊天放入独立的证据 JSON，不能覆盖系统行为。按话题路由是启发式选择，不是语义检索。原始来源与许可随 assets 分发；参考内容为固定基线，不宣称在线验证法律或医疗信息。
-
-## 会话与生命周期
-
-`ManualSession` 仅在 RAM。新输入替换当前会话，取消旧 gate；每个 OCR／分析 callback 同时检查会话对象与请求 generation、Activity 生命周期。内容或目标修改会取消旧请求、清除结果并撤销确认。离开／销毁校对 Activity 会取消后台任务，不在后台偷偷继续展示结果。旋转后可复用仍在内存的输入和已有结果，未完成请求须重新触发；进程死亡后内容消失。
-
-模型 HTTP 超时与状态由共享 `HttpJson` 处理；401 等不补格式重试，429／繁忙和传输重试沿用上游实现。原始错误响应不进入界面或日志。取消未必立即中止 socket，但旧结果绝不重新显示。
-
-手动资料匹配沿用 Jev 本地知识库；分析路径强制不记历史。无账号、收费、支付、远程存储或自动关系档案。
-
-## 构建与测试
-
-JDK 17 / SDK 35 / Gradle 8.9 / AGP 8.7.3 / Kotlin 1.9.24。保留上游 ConversationSession 与 GuardedInputWriter 的回归测试；新增解析、校对、路由、gate、格式重试及分阶段失败测试。遗留适配器和旧 OverlayController 作为上游代码留存，未接入新手动服务，不代表这些自动采集或填入能力可用。
-
-本机验收和真实模型效果必须与单元测试分开记录，不因解析及模拟返回成功而声称实际模型质量通过。见 DEVICE-ACCEPTANCE.md 和 VALIDATION.md。
+原始模型错误正文不进入日志。实际手机/ROM和服务商行为与单元测试分别记录，见VALIDATION.md及DEVICE-ACCEPTANCE.md。

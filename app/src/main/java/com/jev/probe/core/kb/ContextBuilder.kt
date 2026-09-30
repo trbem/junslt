@@ -32,12 +32,13 @@ object ContextBuilder {
      * @return context for this snapshot; every field may be empty, which is the
      *         normal state before the user has built a knowledge base.
      */
-    fun build(context: Context, snapshot: ChatSnapshot, app: String, prefs: Prefs): ChatContext {
+    fun build(context: Context, snapshot: ChatSnapshot, app: String, prefs: Prefs, contactId: String? = null): ChatContext {
         val store = KbStore.get(context)
         val title = snapshot.title ?: ""
 
         // 1. Contact — matched only, never created here.
-        val contact = store.findContact(title, app)
+        val contact = if (contactId != null) store.contacts().firstOrNull { it.id == contactId }
+            else store.findContact(title, app)
 
         // 2. History — recorded and injected only with the user's opt-in.
         val history = if (prefs.contextEnabled && contact != null)

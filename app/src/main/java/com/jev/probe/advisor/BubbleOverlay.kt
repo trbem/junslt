@@ -25,12 +25,13 @@ class BubbleOverlay(private val context: Context, private val prefs: Prefs,
     private fun round(color: Int, radius: Int = 14) = GradientDrawable().apply {
         setColor(color); cornerRadius = dp(radius).toFloat()
     }
-    fun show() {
-        if (bubble != null) { bubble?.visibility = View.VISIBLE; return }
+    fun show(): Boolean {
+        bubble?.let { if (it.isAttachedToWindow) { it.visibility = View.VISIBLE; return true }
+            runCatching { manager.removeViewImmediate(it) }; bubble = null }
         val metrics = context.resources.displayMetrics
         val lp = params().apply {
-            x = prefs.bubbleX.takeIf { it >= 0 }?.coerceIn(0, metrics.widthPixels - dp(54)) ?: metrics.widthPixels - dp(64)
-            y = prefs.bubbleY.takeIf { it >= 0 }?.coerceIn(dp(36), metrics.heightPixels - dp(100)) ?: dp(170)
+            x = (prefs.bubbleX.takeIf { it >= 0 } ?: metrics.widthPixels - dp(64)).coerceIn(0, (metrics.widthPixels - dp(54)).coerceAtLeast(0))
+            y = (prefs.bubbleY.takeIf { it >= 0 } ?: dp(170)).coerceIn(0, (metrics.heightPixels - dp(54)).coerceAtLeast(0))
         }
         val view = TextView(context).apply {
             text = "军师"; textSize = 14f; gravity = Gravity.CENTER
@@ -58,7 +59,7 @@ class BubbleOverlay(private val context: Context, private val prefs: Prefs,
             }
             dragging
         }
-        try { manager.addView(view, lp); bubble = view } catch (_: Exception) { bubble = null }
+        return try { manager.addView(view, lp); bubble = view; true } catch (_: Exception) { bubble = null; false }
     }
     fun hide() { bubble?.visibility = View.GONE; closePanel() }
     fun hideForCapture() { bubble?.visibility = View.INVISIBLE; panel?.visibility = View.INVISIBLE }

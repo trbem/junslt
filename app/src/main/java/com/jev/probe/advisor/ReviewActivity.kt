@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
@@ -11,6 +13,7 @@ import android.view.WindowManager
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.doOnLayout
 import com.jev.probe.SettingsActivity
 import com.jev.probe.capture.ChatCaptureService
 import com.jev.probe.capture.ocr.MlKitOcr
@@ -19,6 +22,9 @@ import com.jev.probe.core.Msg
 import com.jev.probe.core.Prefs
 import com.jev.probe.core.kb.ChatContext
 import com.jev.probe.core.kb.ContextBuilder
+import com.jev.probe.core.kb.Contact
+import com.jev.probe.core.kb.KbStore
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
@@ -40,18 +46,24 @@ class ReviewActivity : AppCompatActivity() {
     private val worker = Executors.newSingleThreadExecutor()
     private var task: Future<*>? = null
     private var busy = false
+    private val main = Handler(Looper.getMainLooper())
+    private var discarded = false
+    private val saveDraft = Runnable { persistDraft() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         val action = intent.getStringExtra("entry") ?: PASTE
         session = if (savedInstanceState == null && action != CAPTURE && action != RESUME) ManualSession.replace()
-            else ManualSession.current ?: ManualSession.replace()
+            else ManualSession.current ?: SessionStore.get(this).loadDraft()?.let { ManualSession.restore(it, true) }
+                ?: ManualSession.replace()
         ui = AdvisorUi(this)
         build()
         if (savedInstanceState == null && action == IMPORT) pickImage()
         if (savedInstanceState == null && action == PASTE) pasteDialog()
-        if (session.bitmap != null && !session.ocrDone) recognize()
+        // Capture and import both use this preview; never calculate crop coordinates before layout.
+        if (session.bitmap != null && !session.ocrDone) preview?.doOnLayout { if (!isDestroyed) recognize() }
+        if (SessionStore.get(this).readFailed) status.text = "草稿无法读取，原文件已保留；请勿清除应用数据"
     }
 
     private fun build() {
@@ -78,12 +90,15 @@ class ReviewActivity : AppCompatActivity() {
         titleInput = ui.edit(session.title, "联系人名称／代号（用于匹配你保存的笔记）").also { context.addView(it) }
         relationshipInput = ui.edit(session.relationship, "关系与经历：不知道可以留空", true).also { context.addView(it) }
         goalInput = ui.edit(session.goal, "本轮目标：例如自然接话、修复、邀约、退出", true).also { context.addView(it) }
+        context.addView(ui.button("选择已有联系人") { chooseContact() })
+        context.addView(ui.button("将当前聊天保存为联系人") { saveContact() })
         background = CheckBox(this).apply {
             text = "使用我手动保存的联系人与命中笔记"; isChecked = session.useBackground; isSaveEnabled = false
             setOnCheckedChangeListener { _, checked -> session.useBackground = checked; invalidateInput() }
         }
         context.addView(background)
-        listOf(titleInput, relationshipInput, goalInput).forEach { it.addTextChangedListener(watcher { invalidateInput() }) }
+        titleInput.addTextChangedListener(watcher { session.contactId = null; invalidateInput() })
+        listOf(relationshipInput, goalInput).forEach { it.addTextChangedListener(watcher { invalidateInput() }) }
         val approval = ui.card(page, "确认后提交")
         confirmed = CheckBox(this).apply {
             text = "我已校对内容、顺序，并确认每条消息的我／对方"; isChecked = session.confirmed; isSaveEnabled = false
@@ -93,7 +108,7 @@ class ReviewActivity : AppCompatActivity() {
             }
         }
         approval.addView(confirmed)
-        approval.addView(ui.text("点击分析会将校对后的文本、填写的背景，以及勾选启用的联系人和笔记发送到你配置的模型接口。不会发送截图，不保存聊天历史。", 12f))
+        approval.addView(ui.text("聊天草稿与生成的建议自动保存于本机，截图不保存。点击分析会将本轮文字、背景及勾选启用的联系人和笔记发送到配置的模型接口；历史记录不会自动发送。", 12f))
         status = ui.text("", 13f); approval.addView(status)
         submit = ui.button("确认并生成军师建议", true) { analyze() }
         approval.addView(submit)
@@ -101,9 +116,18 @@ class ReviewActivity : AppCompatActivity() {
             cancel(); status.text = "已取消，旧请求结果不会显示"
         })
         approval.addView(ui.button("模型接口设置") { startActivity(Intent(this, SettingsActivity::class.java)) })
+        approval.addView(ui.button("重试保存本轮记录") { sync(); if (session.result != null) persistResult() else persistDraft() })
         results = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(results)
-        page.addView(ui.button("清除本轮内容并退出") { cancel(); ManualSession.clear(); finish() })
+        page.addView(ui.button("清除本轮内容并退出") {
+            cancel(); main.removeCallbacks(saveDraft)
+            val target = session
+            SessionWriter.run({ SessionStore.get(this).clearDraft(target.id) }) { ok ->
+                if (isDestroyed) return@run
+                if (!ok) { ui.toast("清除草稿失败"); return@run }
+                discarded = true; ManualSession.clear(); finish()
+            }
+        })
         renderRows()
         session.result?.let { showResult(it) }
     }
@@ -172,6 +196,62 @@ class ReviewActivity : AppCompatActivity() {
         session.confirmed = false; session.result = null
         if (::confirmed.isInitialized) confirmed.isChecked = false
         if (::results.isInitialized) results.removeAllViews()
+        main.removeCallbacks(saveDraft); main.postDelayed(saveDraft, 500)
+    }
+    private fun persistDraft() {
+        if (discarded || !::session.isInitialized) return
+        sync(); val target = session; val record = SessionRecord.snapshot(target)
+        if (record.messages.isEmpty() && record.title.isBlank() && record.relationship.isBlank() && record.goal.isBlank()) return
+        SessionWriter.run({
+            val current = ManualSession.current
+            val replacedWithInput = current !== target && current != null && (current.messages.isNotEmpty() ||
+                current.title.isNotBlank() || current.relationship.isNotBlank() || current.goal.isNotBlank())
+            if (discarded || replacedWithInput) true else SessionStore.get(this).saveDraft(record)
+        }) { ok ->
+            if (!ok && !isDestroyed && ManualSession.current === target) status.text = "本机草稿保存失败，请重试保存；原有记录保留"
+        }
+    }
+    private fun persistResult() {
+        val target = session; val result = target.result ?: return
+        val historyId = target.historyId ?: UUID.randomUUID().toString().also { target.historyId = it }
+        val record = SessionRecord.snapshot(target, historyId, "${target.id}:$historyId")
+        val draft = SessionRecord.snapshot(target)
+        SessionWriter.run({
+            SessionStore.get(this).let { store ->
+                store.saveResult(record) && (ManualSession.current !== target || target.result !== result || discarded || store.saveDraft(draft))
+            }
+        }) { ok ->
+            if (!isDestroyed && ManualSession.current === target && target.result === result)
+                status.text = if (ok) "建议已保存到本机，可在聊天与建议记录查看" else "建议已生成，但本机保存失败，请点击重试保存"
+        }
+    }
+    private fun chooseContact() {
+        sync(); val contacts = KbStore.get(this).contacts().sortedByDescending { it.updatedAt }
+        if (contacts.isEmpty()) { ui.toast("还没有联系人，可先保存当前聊天或从联系人页导入文本"); return }
+        AlertDialog.Builder(this).setTitle("选择联系人").setItems(contacts.map { it.name }.toTypedArray()) { _, index ->
+            val c = contacts[index]; titleInput.setText(c.name)
+            relationshipInput.setText(c.relationship)
+            session.contactId = c.id; invalidateInput(); persistDraft()
+        }.setNegativeButton("取消", null).show()
+    }
+    private fun saveContact() {
+        sync(); val store = KbStore.get(this)
+        val existing = session.contactId?.let { id -> store.contacts().firstOrNull { it.id == id } }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(ui.dp(16), 0, ui.dp(16), 0) }
+        val name = ui.edit(session.title, "名字或代号")
+        val relationship = ui.edit(session.relationship, "关系：仅填写已知信息", true)
+        val notes = ui.edit(existing?.notes.orEmpty(), "希望保存的备注（不会自动从分析推断）", true)
+        box.addView(name); box.addView(relationship); box.addView(notes)
+        val dialog = AlertDialog.Builder(this).setTitle(if (existing == null) "保存联系人" else "更新已选联系人")
+            .setView(box).setNegativeButton("取消", null).setPositiveButton("保存", null).create()
+        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val label = name.text.toString().trim(); if (label.isBlank()) { name.error = "请填写名字"; return@setOnClickListener }
+            val contact = (existing ?: Contact(KbStore.newId(), label)).copy(name = label,
+                relationship = relationship.text.toString().trim(), notes = notes.text.toString().trim(), updatedAt = System.currentTimeMillis())
+            if (!store.saveContact(contact)) { ui.toast("联系人保存失败，请重试"); return@setOnClickListener }
+            titleInput.setText(contact.name); session.contactId = contact.id
+            invalidateInput(); persistDraft(); ui.toast("联系人已保存"); dialog.dismiss()
+        } }; dialog.show()
     }
     private fun cancel() {
         session.gate.cancel(); task?.cancel(true); task = null; busy = false
@@ -203,7 +283,7 @@ class ReviewActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (!alive(target, id)) { bitmap.recycle(); return@runOnUiThread }
                     session = ManualSession.replace(bitmap, "导入截图")
-                    build(); recognize()
+                    build(); preview?.doOnLayout { if (!isDestroyed) recognize() }
                 }
             } catch (_: Exception) {
                 runOnUiThread { if (alive(target, id)) status.text = "无法读取图片，请换一张截图或粘贴文本" }
@@ -212,6 +292,7 @@ class ReviewActivity : AppCompatActivity() {
     }
     private fun recognize() {
         val bitmap = session.bitmap ?: return
+        if (preview?.width == 0 || preview?.height == 0) return
         val region = preview?.region() ?: return
         sync(); invalidateInput()
         val target = session; val id = target.gate.next()
@@ -225,6 +306,7 @@ class ReviewActivity : AppCompatActivity() {
                     it.bounds.right - region.left, it.bounds.bottom - region.top)
             }, region.width())
             renderRows()
+            persistDraft()
             status.text = if (lines.isEmpty()) "没有识别到文字，请调整裁剪、导入截图或粘贴文本"
                 else "已识别 ${lines.size} 行。左右位置仅是提示，请核对说话人、合并多行气泡并删除时间等杂项。"
         }
@@ -239,6 +321,7 @@ class ReviewActivity : AppCompatActivity() {
                 cancel()
                 session = ManualSession.replace(source = "粘贴文本").apply { this.messages = messages; ocrDone = true }
                 build()
+                persistDraft()
             }.show()
     }
     private fun analyze() {
@@ -255,12 +338,17 @@ class ReviewActivity : AppCompatActivity() {
         val relationship = target.relationship
         val goal = target.goal
         val includeBackground = target.useBackground
-        status.text = "正在判断、生成与排序…你可以取消；聊天不会保存。"
+        val contactId = target.contactId
+        val input = SessionRecord.snapshot(target)
+        target.historyId = null
+        status.text = "正在保存输入、判断、生成与排序…你可以取消。"
         task = worker.submit {
             try {
+                if (!ManualSession.accepts(target, id)) throw InterruptedException()
+                if (!SessionStore.get(this).saveDraft(input)) throw LocalSaveException()
                 // Never append history, even if preferences from older development builds enabled it.
                 prefs.contextEnabled = false
-                val ctx = if (includeBackground) ContextBuilder.build(applicationContext, snapshot, "com.tencent.mm", prefs)
+                val ctx = if (includeBackground) ContextBuilder.build(applicationContext, snapshot, "com.tencent.mm", prefs, contactId)
                     else ChatContext(null, emptyList(), emptyList())
                 val result = AdvisorClient(applicationContext, prefs).analyze(snapshot, relationship, goal, ctx)
                 runOnUiThread {
@@ -268,6 +356,7 @@ class ReviewActivity : AppCompatActivity() {
                     busy = false; submit.isEnabled = true; target.result = result
                     status.text = "已生成 · 使用笔记 ${ctx.notes.size} 条 · 联系人 ${if (ctx.contact == null) "未匹配" else "已匹配"}"
                     showResult(result)
+                    persistResult()
                 }
             } catch (_: InterruptedException) { /* Gate prevents late display. */ }
             catch (e: Exception) {
@@ -315,8 +404,8 @@ class ReviewActivity : AppCompatActivity() {
         results.post { (page.parent as? ScrollView)?.smoothScrollTo(0, results.top) }
     }
     private fun alive(target: ManualSession.Session, id: Long) = !isDestroyed && !isFinishing && ManualSession.accepts(target, id)
-    override fun onPause() { sync(); super.onPause() }
-    override fun onDestroy() { cancel(); worker.shutdownNow(); super.onDestroy() }
+    override fun onPause() { main.removeCallbacks(saveDraft); persistDraft(); super.onPause() }
+    override fun onDestroy() { main.removeCallbacks(saveDraft); cancel(); worker.shutdownNow(); super.onDestroy() }
     companion object {
         const val PASTE = "paste"
         const val IMPORT = "import"

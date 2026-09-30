@@ -4,10 +4,13 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import com.jev.probe.MainActivity
+import com.jev.probe.core.Prefs
 
 /**
  * A minimal foreground service whose only job is to keep the app process at
@@ -32,11 +35,20 @@ class KeepAliveService : Service() {
             .setContentText("点击悬浮球才识别，确认后分析；发送由你决定")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
             .setOngoing(true)
+            .setContentIntent(PendingIntent.getActivity(this, 0,
+                Intent(this, MainActivity::class.java).putExtra("recoverOverlay", true),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+            .addAction(Notification.Action.Builder(android.R.drawable.ic_menu_rotate, "恢复悬浮入口",
+                PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java).putExtra("recoverOverlay", true),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)).build())
             .build()
         startForeground(1, notif)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!Prefs(this).enabled) { stopSelf(); return START_NOT_STICKY }
+        return START_STICKY
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 

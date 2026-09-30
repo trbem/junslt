@@ -10,6 +10,11 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.jev.probe.advisor.AdvisorUi
 import com.jev.probe.advisor.ReviewActivity
+import com.jev.probe.advisor.ManualSession
+import com.jev.probe.advisor.SessionStore
+import com.jev.probe.advisor.HistoryActivity
+import com.jev.probe.advisor.ContactImportActivity
+import com.jev.probe.capture.KeepAliveService
 import com.jev.probe.capture.ChatCaptureService
 import com.jev.probe.core.Prefs
 
@@ -17,6 +22,9 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState) }
     override fun onResume() {
         super.onResume()
+        if (intent.getBooleanExtra("recoverOverlay", false)) {
+            intent.removeExtra("recoverOverlay"); recoverOverlay()
+        }
         buildHome()
     }
     private fun buildHome() {
@@ -29,12 +37,27 @@ class MainActivity : AppCompatActivity() {
             ?.split(':')?.mapNotNull { ComponentName.unflattenFromString(it) }
             ?.contains(ComponentName(this, ChatCaptureService::class.java)) == true
         setup.addView(ui.text("无障碍：${if (granted) "已开启" else "未开启"}　悬浮窗：${if (Settings.canDrawOverlays(this)) "已开启" else "未开启"}\n回复密钥：${if (prefs.effectiveReplyKey().isNotBlank()) "已配置" else "未配置"}", 13f))
+        setup.addView(ui.text("悬浮服务：${if (ChatCaptureService.instance != null) "已连接" else "未连接"}" +
+            (ChatCaptureService.instance?.lastError?.let { "\n$it" } ?: ""), 13f))
+        setup.addView(ui.button("恢复悬浮入口") { recoverOverlay(); buildHome() })
         setup.addView(ui.button("${if (prefs.enabled) "关闭" else "开启"}悬浮助手", true) {
-            prefs.enabled = !prefs.enabled; buildHome()
+            prefs.enabled = !prefs.enabled
+            if (!prefs.enabled) stopService(Intent(this, KeepAliveService::class.java))
+            buildHome()
         })
         val input = ui.card(page, "先试一段聊天")
         input.addView(ui.button("粘贴聊天文本") { startActivity(ReviewActivity.intent(this, ReviewActivity.PASTE)) })
         input.addView(ui.button("导入已有截图") { startActivity(ReviewActivity.intent(this, ReviewActivity.IMPORT)) })
+        input.addView(ui.text("截图导入存在已知故障，完整修复留待后续版本。", 12f))
+        input.addView(ui.button("继续上次聊天草稿") {
+            val record = SessionStore.get(this).loadDraft()
+            val active = ManualSession.current
+            if (record != null && (active == null || (active.messages.isEmpty() && active.title.isBlank() &&
+                    active.relationship.isBlank() && active.goal.isBlank() && active.result == null))) ManualSession.restore(record, true)
+            if (ManualSession.current == null) android.widget.Toast.makeText(this, "没有可恢复的草稿", android.widget.Toast.LENGTH_SHORT).show()
+            else startActivity(ReviewActivity.intent(this, ReviewActivity.RESUME))
+        })
+        input.addView(ui.button("聊天与建议记录") { startActivity(Intent(this, HistoryActivity::class.java)) })
         input.addView(ui.text("这两个入口不依赖无障碍或悬浮窗权限。", 12f))
         val permission = ui.card(page, "开启微信悬浮入口")
         permission.addView(ui.button("1 · 开启无障碍「聊天军师」") {
@@ -53,16 +76,25 @@ class MainActivity : AppCompatActivity() {
         val options = ui.card(page, "配置与资料")
         options.addView(ui.button("模型接口设置") { startActivity(Intent(this, SettingsActivity::class.java)) })
         options.addView(ui.button("我的联系人与笔记") { startActivity(Intent(this, KnowledgeActivity::class.java)) })
+        options.addView(ui.button("文本智能导入联系人") { startActivity(Intent(this, ContactImportActivity::class.java)) })
         options.addView(ui.button("关于、隐私与开源许可") {
             val licenses = listOf("LICENSE-jev.txt", "NOTICE-jev.txt", "LICENSE-goutoujunshi.txt")
                 .joinToString("\n\n") { assets.open("advisor/$it").bufferedReader().use { r -> r.readText() } }
-            AlertDialog.Builder(this).setTitle("聊天军师 · 0.1.0")
+            AlertDialog.Builder(this).setTitle("聊天军师 · 0.1.1")
                 .setMessage("基于 Jev 聊天助手与狗头军师二次开发，不代表原作者出品。\n" +
                     "https://github.com/jev-chat/jev-chat-jarvis\nhttps://github.com/shengjidaguai-china/goutoujunshi\n\n" +
-                    "截图、识别文本和分析默认仅在内存中；不记录聊天历史。联系人与笔记仅在你手动保存后写入本机。" +
+                    "聊天草稿和建议自动保存在本机，原截图不保存；历史不会自动发送给模型。联系人和笔记经你确认后保存。文本导入使用配置的回复模型。" +
                     "确认分析会把文本、关系背景及启用的笔记发送到你配置的模型服务商，由其政策决定处理方式。" +
                     "密钥存放在 App 私有设置，禁用系统备份。不代发消息。\n\n" + licenses)
                 .setPositiveButton("知道了", null).show()
         })
+    }
+    private fun recoverOverlay() {
+        val prefs = Prefs(this); prefs.enabled = true
+        val service = ChatCaptureService.instance
+        if (service != null) { service.recover(); return }
+        runCatching { KeepAliveService.start(this) }
+        android.widget.Toast.makeText(this, "悬浮服务尚未连接，请在无障碍设置中重新开启聊天军师", android.widget.Toast.LENGTH_LONG).show()
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
 }

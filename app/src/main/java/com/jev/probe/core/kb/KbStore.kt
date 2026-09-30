@@ -125,13 +125,13 @@ class KbStore private constructor(context: Context) {
         val existing = findContact(title, app)
         if (existing == null) {
             val aliases = if (displayName(title) != title.trim()) listOf(title.trim()) else emptyList()
-            saveContact(Contact(
+            val saved = saveContact(Contact(
                 id = newId(),
                 name = display,
                 aliases = aliases,
                 apps = if (app.isBlank()) emptyList() else listOf(app)
             ))
-            return "已存为联系人「${display}」"
+            return if (saved) "已存为联系人「${display}」" else "联系人保存失败，请重试"
         }
         val apps = if (app.isBlank() || existing.apps.contains(app)) existing.apps else existing.apps + app
         val raw = title.trim()
@@ -140,8 +140,8 @@ class KbStore private constructor(context: Context) {
             existing.aliases + raw else existing.aliases
         if (apps == existing.apps && aliases == existing.aliases)
             return "联系人「${existing.name}」已存在"
-        saveContact(existing.copy(apps = apps, aliases = aliases))
-        return "已并入联系人「${existing.name}」"
+        val saved = saveContact(existing.copy(apps = apps, aliases = aliases))
+        return if (saved) "已并入联系人「${existing.name}」" else "联系人保存失败，请重试"
     }
 
     // ---------------------------------------------------------------- history
@@ -476,10 +476,12 @@ class KbStore private constructor(context: Context) {
 
         @Volatile private var instance: KbStore? = null
 
-        fun get(context: Context): KbStore =
-            instance ?: synchronized(this) {
-                instance ?: KbStore(context).also { instance = it }
+        fun get(context: Context): KbStore {
+            val expected = File(context.applicationContext.filesDir, "kb")
+            return instance?.takeIf { it.root == expected } ?: synchronized(this) {
+                instance?.takeIf { it.root == expected } ?: KbStore(context).also { instance = it }
             }
+        }
 
         fun newId(): String = java.util.UUID.randomUUID().toString().substring(0, 12)
 

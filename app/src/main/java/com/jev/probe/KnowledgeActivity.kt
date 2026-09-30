@@ -4,6 +4,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.content.Intent
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -19,6 +20,10 @@ import androidx.appcompat.app.AppCompatActivity
 import com.jev.probe.core.kb.Contact
 import com.jev.probe.core.kb.KbStore
 import com.jev.probe.core.kb.Note
+import com.jev.probe.advisor.ContactImportActivity
+import com.jev.probe.advisor.HistoryActivity
+import com.jev.probe.advisor.SessionStore
+import com.jev.probe.advisor.ManualSession
 import kotlin.math.roundToInt
 
 /**
@@ -63,6 +68,7 @@ class KnowledgeActivity : AppCompatActivity() {
         render()
     }
 
+    override fun onResume() { super.onResume(); if (::store.isInitialized) render() }
     // --------------------------------------------------------------- screens
 
     private fun render() {
@@ -221,10 +227,12 @@ class KnowledgeActivity : AppCompatActivity() {
 
     private fun renderContacts() {
         val contacts = store.contacts().sortedByDescending { it.updatedAt }
-        container.addView(twoButtons("新建联系人", { editContactDialog(null) }, null, null))
+        container.addView(twoButtons("新建联系人", { editContactDialog(null) }, "文本智能导入", {
+            startActivity(Intent(this, ContactImportActivity::class.java))
+        }))
         if (contacts.isEmpty()) {
             container.addView(emptyCard(
-                "还没有联系人。也可以在聊天里长按悬浮球，选「把当前会话存为联系人」。"))
+                "还没有联系人。可在聊天校对页保存当前联系人，或粘贴资料、选择 TXT 让模型识别。"))
             return
         }
         contacts.forEach { container.addView(contactRow(it)) }
@@ -248,9 +256,15 @@ class KnowledgeActivity : AppCompatActivity() {
             c.addView(text("备注：" + c0.notes.replace("\n", " ").take(40), 12f, sub)
                 .apply { setPadding(0, dp(3), 0, 0) })
 
+        val history = TextView(this).apply {
+            text = "查看此人的建议记录"; textSize = 13f; setTextColor(accent)
+            setPadding(0, dp(10), 0, dp(6))
+            setOnClickListener { startActivity(Intent(this@KnowledgeActivity, HistoryActivity::class.java).putExtra("contactId", c0.id)) }
+        }
+        c.addView(history)
         val logN = store.logSize(c0.id)
         val clear = TextView(this).apply {
-            text = "清空此人历史（$logN 条）"
+            text = "清空旧版聊天日志（$logN 条，不含建议记录）"
             textSize = 12.5f; setTextColor(red); setTypeface(typeface, Typeface.BOLD)
             setPadding(0, dp(10), 0, dp(2))
             setOnClickListener {
@@ -263,8 +277,11 @@ class KnowledgeActivity : AppCompatActivity() {
         c.addView(clear)
         c.setOnClickListener { editContactDialog(c0) }
         c.setOnLongClickListener {
-            confirm("删除联系人", "删除「${c0.name}」及其全部历史？不可恢复。") {
-                store.deleteContact(c0.id); render()
+            confirm("删除联系人", "删除「${c0.name}」和旧版日志？建议记录保留，并解除联系人关联。") {
+                if (!SessionStore.get(this).unlinkContact(c0.id)) { toast("记录关联更新失败，联系人保留"); return@confirm }
+                if (!store.deleteContact(c0.id)) toast("联系人删除失败")
+                else ManualSession.current?.takeIf { it.contactId == c0.id }?.let { it.contactId = null }
+                render()
             }
             true
         }
@@ -294,7 +311,7 @@ class KnowledgeActivity : AppCompatActivity() {
             .setPositiveButton("保存") { _, _ ->
                 val name = nameEdit.text.toString().trim()
                 if (name.isBlank()) { toast("名字不能空"); return@setPositiveButton }
-                store.saveContact(Contact(
+                val saved = store.saveContact(Contact(
                     id = existing?.id ?: KbStore.newId(),
                     name = name,
                     aliases = aliasEdit.text.toString().split("\n")
@@ -304,6 +321,7 @@ class KnowledgeActivity : AppCompatActivity() {
                     notes = notesEdit.text.toString().trim(),
                     autoSummary = existing?.autoSummary ?: ""
                 ))
+                if (!saved) toast("联系人保存失败，请重试")
                 render()
             }
             .setNegativeButton("取消", null)
