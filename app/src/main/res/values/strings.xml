@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">聊天军师</string>
+    <string name="a11y_desc">点击悬浮球后截取当前屏幕，在本机识别。确认后才提交模型分析；仅复制回复，由你粘贴和发送。</string>
+</resources>
